@@ -165,7 +165,7 @@ async function sendEmail(to, naam, emailBody) {
 </html>`;
 
   const payload = JSON.stringify({
-    from: "Saskia <saskia@mijnlevensgetal.nl>",
+    from: "Saskia <onboarding@resend.dev>",
     to: [to],
     subject: `${naam ? naam.split(" ")[0] + ", " : ""}jouw numerologisch rapport is klaar ✨`,
     html: html,
