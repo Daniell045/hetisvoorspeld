@@ -1,10 +1,10 @@
 // netlify/functions/webhook.js
-// Mollie webhook → MailerLite koppeling
+// Mollie → Claude API → Resend email + MailerLite
 // Het Is Voorspeld — mijnlevensgetal.nl
 
 const https = require("https");
 
-// ─── GROEPSNAMEN (geen IDs nodig — worden automatisch opgezocht) ────────────
+// ─── GROEPSNAMEN ───────────────────────────────────────────────────────────
 const GROEP_NAMEN = {
   rapport:  "rapport kopers",
   maand:    "maand leden",
@@ -30,6 +30,7 @@ function httpsRequest(options, body) {
   });
 }
 
+// ─── MOLLIE ────────────────────────────────────────────────────────────────
 async function getMolliePayment(paymentId) {
   const res = await httpsRequest({
     hostname: "api.mollie.com",
@@ -40,7 +41,7 @@ async function getMolliePayment(paymentId) {
   return res.body;
 }
 
-// Haal alle MailerLite groepen op en zoek de juiste op naam
+// ─── MAILERLITE ─────────────────────────────────────────────────────────────
 async function getGroupIdByName(name) {
   const res = await httpsRequest({
     hostname: "connect.mailerlite.com",
@@ -51,37 +52,25 @@ async function getGroupIdByName(name) {
       "Content-Type": "application/json",
     },
   });
-
-  if (res.status !== 200) {
-    throw new Error(`MailerLite groups ophalen mislukt: ${res.status}`);
-  }
-
+  if (res.status !== 200) throw new Error(`Groups ophalen mislukt: ${res.status}`);
   const groups = res.body.data || [];
-  const match = groups.find(
-    (g) => g.name.toLowerCase().trim() === name.toLowerCase().trim()
-  );
-
-  if (!match) {
-    throw new Error(`Groep niet gevonden: "${name}". Beschikbaar: ${groups.map(g => g.name).join(", ")}`);
-  }
-
+  const match = groups.find(g => g.name.toLowerCase().trim() === name.toLowerCase().trim());
+  if (!match) throw new Error(`Groep niet gevonden: "${name}"`);
   return String(match.id);
 }
 
-async function addToMailerLite(subscriberData, groupId) {
+async function addToMailerLite(data, groupId) {
   const payload = JSON.stringify({
-    email: subscriberData.email,
+    email: data.email,
     fields: {
-      name:          subscriberData.naam          || "",
-      last_name:     "",
-      levensgetal:   String(subscriberData.levensgetal   || ""),
-      geboortedatum: subscriberData.geboortedatum || "",
-      product:       subscriberData.product       || "",
+      name:          data.naam          || "",
+      levensgetal:   String(data.levensgetal  || ""),
+      geboortedatum: data.geboortedatum || "",
+      product:       data.product       || "",
     },
     groups: [groupId],
     status: "active",
   });
-
   const res = await httpsRequest({
     hostname: "connect.mailerlite.com",
     path: "/api/subscribers",
@@ -92,20 +81,117 @@ async function addToMailerLite(subscriberData, groupId) {
       "Content-Length": Buffer.byteLength(payload),
     },
   }, payload);
-
   if (res.status !== 200 && res.status !== 201) {
-    throw new Error(`MailerLite subscriber fout: ${res.status} — ${JSON.stringify(res.body)}`);
+    throw new Error(`MailerLite fout: ${res.status} — ${JSON.stringify(res.body)}`);
   }
-
-  console.log(`✅ MailerLite: ${subscriberData.email} toegevoegd aan groep ID ${groupId}`);
-  return res.body;
+  console.log(`✅ MailerLite: ${data.email} toegevoegd`);
 }
 
-// ─── PRODUCT BEPALEN ───────────────────────────────────────────────────────
+// ─── CLAUDE API ─────────────────────────────────────────────────────────────
+async function generateRapportEmail(meta) {
+  const prompt = `Je bent Saskia, numeroloog uit Amsterdam. Schrijf een persoonlijke email aan ${meta.naam || "jou"} na aankoop van hun numerologisch rapport.
+
+KLANTPROFIEL:
+- Naam: ${meta.naam || "onbekend"}
+- Geboortedatum: ${meta.geboortedatum || "onbekend"}
+- Levensgetal: ${meta.levensgetal || "onbekend"}
+- Zielsgetal: ${meta.zielsgetal || "onbekend"}
+- Jaarcyclus 2026: ${meta.jaarcyclus || "onbekend"}
+
+QUIZ ANTWOORDEN:
+- Geslacht: ${meta.gender || "-"}
+- Leeftijd: ${meta.age || "-"}
+- Focus gebied: ${meta.focus || "-"}
+- Herkenbaar patroon: ${meta.pattern || "-"}
+- Hoe ze zich voelen: ${meta.feeling || "-"}
+- Besluitvorming: ${meta.decision || "-"}
+- Relaties: ${meta.relation || "-"}
+- Grootste blokkade: ${meta.block || "-"}
+- Geloof in synchroniciteit: ${meta.belief || "-"}
+
+Schrijf een warme, persoonlijke email van Saskia. Verwerk hun specifieke antwoorden en levensgetal erin. Begin met een persoonlijke opening gebaseerd op hun naam en gevoel. Verwijs naar hun levensgetal en wat dat betekent. Ga in op hun grootste focus gebied en blokkade. Sluit af met een preview van wat er in het rapport staat. Gebruik Nederlandse spreektaal, warm maar professioneel. Max 350 woorden. Geen markdown, gewone tekst met alinea's.`;
+
+  const requestBody = JSON.stringify({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 800,
+    messages: [{ role: "user", content: prompt }]
+  });
+
+  const res = await httpsRequest({
+    hostname: "api.anthropic.com",
+    path: "/v1/messages",
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": process.env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "Content-Length": Buffer.byteLength(requestBody),
+    },
+  }, requestBody);
+
+  if (res.status !== 200) {
+    throw new Error(`Claude API fout: ${res.status} — ${JSON.stringify(res.body)}`);
+  }
+
+  return res.body.content[0].text;
+}
+
+// ─── RESEND EMAIL ───────────────────────────────────────────────────────────
+async function sendEmail(to, naam, emailBody) {
+  const htmlBody = emailBody
+    .split("\n\n")
+    .map(p => `<p style="margin:0 0 16px 0;line-height:1.6">${p.replace(/\n/g, "<br>")}</p>`)
+    .join("");
+
+  const html = `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family:Georgia,serif;max-width:600px;margin:0 auto;padding:40px 20px;color:#2d1b4e;background:#faf8f5">
+  <div style="text-align:center;margin-bottom:32px">
+    <p style="font-size:13px;color:#8b7a9e;letter-spacing:2px;margin:0">HET IS VOORSPELD</p>
+    <p style="font-size:11px;color:#c9a96e;margin:4px 0 0">mijnlevensgetal.nl</p>
+  </div>
+  <div style="background:white;border-radius:12px;padding:32px;border:1px solid #e8e0f0">
+    ${htmlBody}
+    <p style="margin:24px 0 0;color:#8b7a9e;font-size:13px">Veel liefde en licht,</p>
+    <p style="margin:4px 0 0;font-size:15px;color:#2d1b4e"><strong>Saskia</strong></p>
+    <p style="margin:2px 0 0;font-size:12px;color:#8b7a9e">Numeroloog — Het Is Voorspeld</p>
+  </div>
+  <p style="text-align:center;font-size:11px;color:#c9b8d4;margin-top:24px">
+    Je ontvangt dit omdat je een rapport hebt aangevraagd via mijnlevensgetal.nl
+  </p>
+</body>
+</html>`;
+
+  const payload = JSON.stringify({
+    from: "Saskia <saskia@mijnlevensgetal.nl>",
+    to: [to],
+    subject: `${naam ? naam.split(" ")[0] + ", " : ""}jouw numerologisch rapport is klaar ✨`,
+    html: html,
+  });
+
+  const res = await httpsRequest({
+    hostname: "api.resend.com",
+    path: "/emails",
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+      "Content-Length": Buffer.byteLength(payload),
+    },
+  }, payload);
+
+  if (res.status !== 200 && res.status !== 201) {
+    throw new Error(`Resend fout: ${res.status} — ${JSON.stringify(res.body)}`);
+  }
+  console.log(`📧 Email verstuurd naar ${to}`);
+}
+
+// ─── PRODUCT BEPALEN ────────────────────────────────────────────────────────
 function getProductKey(payment) {
   const plan   = (payment.metadata?.plan || "").toLowerCase();
   const amount = parseFloat(payment.amount?.value || "0");
-
   if (plan === "rapport"  || (amount > 0  && amount <= 8))  return "rapport";
   if (plan === "maand"    || (amount > 8  && amount <= 12)) return "maand";
   if (plan === "kwartaal" || (amount > 12 && amount <= 35)) return "kwartaal";
@@ -114,7 +200,7 @@ function getProductKey(payment) {
   return "rapport";
 }
 
-// ─── MAIN HANDLER ──────────────────────────────────────────────────────────
+// ─── MAIN HANDLER ───────────────────────────────────────────────────────────
 exports.handler = async (event) => {
   if (event.httpMethod !== "POST") {
     return { statusCode: 405, body: "Method Not Allowed" };
@@ -128,44 +214,71 @@ exports.handler = async (event) => {
     return { statusCode: 400, body: "Ongeldige body" };
   }
 
-  if (!paymentId) {
-    return { statusCode: 400, body: "Geen payment ID" };
-  }
+  if (!paymentId) return { statusCode: 400, body: "Geen payment ID" };
 
-  console.log(`🔔 Webhook ontvangen: ${paymentId}`);
+  console.log(`🔔 Webhook: ${paymentId}`);
 
   try {
-    // 1. Betaling ophalen bij Mollie
     const payment = await getMolliePayment(paymentId);
     console.log(`💳 Status: ${payment.status} | ${payment.amount?.value} | ${payment.metadata?.email}`);
 
-    // 2. Alleen verwerken als betaald
     if (payment.status !== "paid") {
       return { statusCode: 200, body: "OK - niet betaald" };
     }
 
-    // 3. Email verplicht
     const meta = payment.metadata || {};
     if (!meta.email) {
       console.error("❌ Geen email in metadata");
       return { statusCode: 200, body: "OK - geen email" };
     }
 
-    // 4. Groepsnaam → ID automatisch ophalen via API
     const productKey = getProductKey(payment);
-    const groepNaam  = GROEP_NAMEN[productKey];
-    const groupId    = await getGroupIdByName(groepNaam);
 
-    console.log(`📦 Product: ${productKey} → groep: "${groepNaam}" (ID: ${groupId})`);
+    // 1. MailerLite subscriber toevoegen
+    try {
+      const groepNaam = GROEP_NAMEN[productKey];
+      const groupId   = await getGroupIdByName(groepNaam);
+      await addToMailerLite({
+        email:          meta.email,
+        naam:           meta.naam          || meta.name || "",
+        levensgetal:    meta.levensgetal   || "",
+        geboortedatum:  meta.geboortedatum || "",
+        product:        productKey,
+      }, groupId);
+    } catch (err) {
+      console.error("⚠️ MailerLite fout (niet fataal):", err.message);
+    }
 
-    // 5. Subscriber toevoegen aan MailerLite
-    await addToMailerLite({
-      email:          meta.email,
-      naam:           meta.naam          || meta.name || "",
-      levensgetal:    meta.levensgetal   || "",
-      geboortedatum:  meta.geboortedatum || "",
-      product:        productKey,
-    }, groupId);
+    // 2. Alleen voor rapport: AI email genereren + versturen
+    if (productKey === "rapport") {
+      try {
+        console.log("🤖 Claude API aanroepen...");
+        const emailBody = await generateRapportEmail({
+          naam:          meta.naam          || meta.name || "",
+          geboortedatum: meta.geboortedatum || "",
+          levensgetal:   meta.levensgetal   || "",
+          zielsgetal:    meta.zielsgetal    || "",
+          jaarcyclus:    meta.jaarcyclus    || "",
+          gender:        meta.gender        || "",
+          age:           meta.age           || "",
+          focus:         meta.focus         || "",
+          pattern:       meta.pattern       || "",
+          feeling:       meta.feeling       || "",
+          decision:      meta.decision      || "",
+          relation:      meta.relation      || "",
+          block:         meta.block         || "",
+          belief:        meta.belief        || "",
+        });
+
+        await sendEmail(
+          meta.email,
+          meta.naam || meta.name || "",
+          emailBody
+        );
+      } catch (err) {
+        console.error("⚠️ Email generatie/verzending fout:", err.message);
+      }
+    }
 
     return { statusCode: 200, body: "OK" };
 
