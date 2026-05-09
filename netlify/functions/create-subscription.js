@@ -1,3 +1,6 @@
+// netlify/functions/create-subscription.js
+// Mollie betaling aanmaken — met alle quiz antwoorden in metadata
+
 const https = require('https');
 
 exports.handler = async (event) => {
@@ -5,7 +8,12 @@ exports.handler = async (event) => {
     return { statusCode: 405, body: 'Method not allowed' };
   }
 
-  const { plan, email, name, levensgetal, geboortedatum } = JSON.parse(event.body);
+  const {
+    plan, email, name,
+    levensgetal, zielsgetal, jaarcyclus, geboortedatum,
+    gender, age, focus, pattern, feeling, decision, relation, block, belief
+  } = JSON.parse(event.body);
+
   const apiKey = process.env.MOLLIE_API_KEY;
 
   const plans = {
@@ -25,11 +33,22 @@ exports.handler = async (event) => {
     redirectUrl: 'https://mijnlevensgetal.nl/bedankt.html',
     webhookUrl: 'https://mijnlevensgetal.nl/.netlify/functions/webhook',
     metadata: {
-      email:         email        || '',
-      naam:          name         || '',
+      email:         email         || '',
+      naam:          name          || '',
       plan:          plan,
-      levensgetal:   levensgetal  || '',
+      levensgetal:   levensgetal   || '',
+      zielsgetal:    zielsgetal    || '',
+      jaarcyclus:    jaarcyclus    || '',
       geboortedatum: geboortedatum || '',
+      gender:        gender        || '',
+      age:           age           || '',
+      focus:         focus         || '',
+      pattern:       pattern       || '',
+      feeling:       feeling       || '',
+      decision:      decision      || '',
+      relation:      relation      || '',
+      block:         block         || '',
+      belief:        belief        || '',
     },
     method: ['ideal', 'creditcard', 'bancontact'],
     locale: 'nl_NL',
@@ -56,6 +75,7 @@ exports.handler = async (event) => {
             body: JSON.stringify({ checkoutUrl: result._links.checkout.href }),
           });
         } else {
+          console.error('Mollie fout:', JSON.stringify(result));
           resolve({ statusCode: 500, body: JSON.stringify(result) });
         }
       });
