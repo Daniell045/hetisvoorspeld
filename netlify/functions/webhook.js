@@ -3,6 +3,7 @@
 // Het Is Voorspeld — mijnlevensgetal.nl
 
 const https = require("https");
+const { getStore } = require("@netlify/blobs");
 
 // ─── GROEPSNAMEN ───────────────────────────────────────────────────────────
 const GROEP_NAMEN = {
@@ -215,6 +216,19 @@ exports.handler = async (event) => {
   }
 
   if (!paymentId) return { statusCode: 400, body: "Geen payment ID" };
+
+  // Duplicate check via Netlify Blobs (persistent)
+  try {
+    const store = getStore("processed_payments");
+    const alreadyDone = await store.get(paymentId);
+    if (alreadyDone) {
+      console.log(`⏭️ Al verwerkt: ${paymentId}`);
+      return { statusCode: 200, body: "OK - al verwerkt" };
+    }
+    await store.set(paymentId, "done");
+  } catch (e) {
+    console.log("Blobs niet beschikbaar, ga door:", e.message);
+  }
 
   console.log(`🔔 Webhook: ${paymentId}`);
 
